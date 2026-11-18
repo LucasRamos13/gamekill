@@ -1,0 +1,101 @@
+#!/usr/bin/env bash
+# GameKill - rotina de recuperacao executada ANTES de considerar encerrar um jogo.
+#
+# Nao encerra, congela nem suspende nenhum processo. Acoes:
+#   1. Notificacao na area de trabalho avisando sobre a pressao de memoria.
+#   2. Recuperacao proativa de memoria (cgroup v2 memory.reclaim) nos
+#      aplicativos que NAO sao jogos (navegador, cliente Steam, Discord...).
+#      O kernel descarta cache de arquivos e, se houver swap livre, move
+#      paginas ociosas para o zram. Nada e encerrado.
+#
+# Nunca toca em: jogos Steam (app-steam-app*), session.slice (KWin/Plasma),
+# nem no proprio watchdog.
+#
+# Uso: pre-recovery [unidade-do-jogo-candidato] [--dry-run]
+
+set -u
+TAG="gamekill-recovery"
+GAME_UNIT=""
+DRY_RUN=0
+
+for arg in "$@"; do
+    case "$arg" in
+        --dry-run) DRY_RUN=1 ;;
+        *) GAME_UNIT="$arg" ;;
+    esac
+done
+
+USER_CG="/sys/fs/cgroup$(awk -F: '$1 == "0" {print $3}' /proc/self/cgroup | sed -E 's#(/user@[0-9]+\.service)/.*#\1#')"
+
+# Limites por cgroup
+MAX_RECLAIM_BYTES=$((1024 * 1024 * 1024))   # no maximo 1 GiB por app
+MIN_CGROUP_BYTES=$((64 * 1024 * 1024))      # ignora apps com menos de 64 MiB
+RECLAIM_FRACTION=4                          # pede ate 1/4 da memoria do app
+SWAP_NEARLY_FULL=85                         # acima disso, so descarta cache
+
+log() {
+    logger -t "$TAG" -- "$*"
+    printf '[Recovery] %s\n' "$*"
+}
+
+swap_percent() {
+    awk '/^SwapTotal:/ {t=$2} /^SwapFree:/ {f=$2}
+         END { if (t > 0) printf "%d", 100*(t-f)/t; else print 100 }' /proc/meminfo
+}
+
+notify() {
+    (( DRY_RUN )) && { log "DRY-RUN: notificaria o usuario."; return; }
+    command -v notify-send >/dev/null || return
+    timeout 3 notify-send -u critical -a GameKill -i dialog-warning \
+        "Memoria critica" \
+        "Pressao severa de memoria. Feche navegador ou outros apps.${GAME_UNIT:+ O jogo pode ser encerrado se nao houver melhora.}" \
+        2>/dev/null || true
+}
+
+reclaim_all() {
+    local swap_pct mode_arg cg name cur want before after freed_total=0
+
+    swap_pct=$(swap_percent)
+    if (( swap_pct >= SWAP_NEARLY_FULL )); then
+        mode_arg=" swappiness=0"
+        log "Swap em ${swap_pct}%: recuperando apenas cache de arquivos."
+    else
+        mode_arg=""
+        log "Swap em ${swap_pct}%: recuperando cache e paginas ociosas."
+    fi
+
+    for cg in "$USER_CG"/app.slice/*/ "$USER_CG"/background.slice/*/; do
+        cg="${cg%/}"
+        [[ -w "$cg/memory.reclaim" ]] || continue
+        name="${cg##*/}"
+
+        # Protecoes: jogos e o proprio watchdog
+        [[ "$name" == app-steam-app* ]] && continue
+        [[ -n "$GAME_UNIT" && "$name" == "$GAME_UNIT" ]] && continue
+        [[ "$name" == gamekill-watchdog.service ]] && continue
+
+        cur=$(<"$cg/memory.current")
+        (( cur >= MIN_CGROUP_BYTES )) || continue
+
+        want=$(( cur / RECLAIM_FRACTION ))
+        (( want > MAX_RECLAIM_BYTES )) && want=$MAX_RECLAIM_BYTES
+
+        if (( DRY_RUN )); then
+            log "DRY-RUN: recuperaria $((want / 1048576)) MiB de $name ($((cur / 1048576)) MiB)"
+            continue
+        fi
+
+        before=$cur
+        # EAGAIN (nao conseguiu tudo) e normal; limite de tempo por app.
+        timeout 3 bash -c 'printf "%s\n" "$1" > "$2"' _ "${want}${mode_arg}" "$cg/memory.reclaim" 2>/dev/null || true
+        after=$(<"$cg/memory.current")
+        (( before > after )) && freed_total=$(( freed_total + before - after ))
+    done
+
+    (( DRY_RUN )) || log "Memoria recuperada de apps nao-jogo: $((freed_total / 1048576)) MiB"
+}
+
+log "Iniciando recuperacao.${GAME_UNIT:+ Jogo protegido: $GAME_UNIT}"
+notify
+reclaim_all
+exit 0

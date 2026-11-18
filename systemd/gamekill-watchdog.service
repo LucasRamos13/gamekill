@@ -1,0 +1,21 @@
+[Unit]
+Description=GameKill Emergency Memory Watchdog
+Documentation=file://%h/.config/gamekill/README.md
+After=graphical-session.target
+
+[Service]
+Type=simple
+Documentation=
+ExecStart=%h/.local/bin/gamekill-watchdog --auto
+Restart=always
+RestartSec=3
+# Nice 0: em emergencia precisa reagir rapido (o custo de CPU e ~zero).
+Nice=0
+# Nunca ir para o swap: o watchdog continua responsivo durante thrashing.
+MemorySwapMax=0
+MemoryLow=16M
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=default.target

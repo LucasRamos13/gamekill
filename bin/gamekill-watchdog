@@ -1,0 +1,547 @@
+#!/usr/bin/env bash
+# GameKill watchdog v3 - protege o sistema (e o KDE) de jogos que esgotam a RAM.
+#
+# Politica (inalterada desde a v2, aprovada pelo usuario):
+#   - Nunca encerra um jogo so por usar muita RAM. Exige pressao severa,
+#     persistente (30s), rotina de recuperacao e nova confirmacao (10s).
+#   - So encerra jogos Steam confirmados (scope app-steam-app<ID>-*.scope com
+#     o processo "SteamLaunch AppId=<ID>"), nunca KDE/Plasma ou outros apps.
+#
+# Novidades da v3:
+#   - Leitura de /proc e /sys sem forks (bash puro): custo de CPU ~zero.
+#   - Jogos recebem oom_score_adj alto: se o kernel precisar matar algo,
+#     escolhe o jogo, nao o KWin/Plasma.
+#   - Failsafe do Plasma: se o plasmashell morrer e o systemd desistir de
+#     reinicia-lo, o watchdog o reinicia (com limite).
+#   - Failsafe do KWin: se o compositor ficar travado (sem responder) por
+#     ~60s enquanto um jogo roda, o jogo e encerrado para destravar a tela.
+#   - Cooldown nao bloqueia mais o monitoramento.
+#   - --kill-now: encerra o maior jogo imediatamente (atalho/TTY).
+
+set -u
+shopt -s nullglob
+
+TAG="gamekill-watchdog"
+INTERVAL=2
+
+# ---------- Limites de memoria (PSI em centesimos de %: 4000 = 40%) ----------
+MIN_AVAILABLE_KB=350000
+FULL_PSI_LIMIT=4000
+LOW_AVAILABLE_KB=256000
+LOW_SOME_PSI=6000
+
+FINAL_AVAILABLE_KB=256000
+FINAL_FULL_PSI=6000
+FINAL_EXTREME_KB=180000
+FINAL_EXTREME_SOME=7000
+
+SWAP_AVAILABLE_KB=350000
+# Abaixo do SwapUsedLimit=90% do systemd-oomd.
+SWAP_USED_PERCENT=85
+SWAP_SOME_PSI=6000
+
+REQUIRED_COUNT=15          # 15 x 2s = 30s de pressao critica continua
+FINAL_REQUIRED_COUNT=5     # 5 x 2s = 10s de emergencia apos recuperacao
+COOLDOWN=300               # apos encerrar um jogo
+RECOVERED_COOLDOWN=60      # apos recuperacao bem-sucedida (jogo preservado)
+RECOVERY_WAIT=10
+RECOVERY_TIMEOUT=20
+
+# ---------- Protecao do KDE ----------
+GAME_OOM_SCORE_ADJ=700      # kernel OOM prefere o jogo (KWin/Plasma = 200)
+GAME_SCAN_EVERY=5           # a cada 5 ciclos (10s)
+KDE_CHECK_EVERY=5           # a cada 5 ciclos (10s)
+KWIN_PING_TIMEOUT=4         # segundos
+KWIN_HANG_LIMIT=6           # 6 falhas seguidas (~60-85s) com jogo rodando
+PLASMA_DOWN_LIMIT=3         # 3 checagens (~30s) sem plasmashell
+PLASMA_MAX_RESTARTS=5       # por hora
+
+HOOK="$HOME/.config/gamekill/pre-recovery"
+PROTECTED_FILE="$HOME/.config/gamekill/protected-appids"
+
+MODE="${1:---help}"
+DRY_RUN=0
+
+# Cgroup do user manager (ex.: /sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service)
+USER_CG="/sys/fs/cgroup/user.slice/user-$UID.slice/user@$UID.service"
+SESSION_CG="$USER_CG/session.slice"
+
+# sleep sem fork: read com timeout num pipe que nunca recebe dados
+exec {NAP_FD}<> <(:)
+nap() { read -r -t "$1" -u "$NAP_FD" _ 2>/dev/null; return 0; }
+
+log() {
+    logger -t "$TAG" -- "$*" 2>/dev/null
+    printf '[GameKill] %s\n' "$*"
+}
+
+notify() {
+    # $1 = urgencia, $2 = titulo, $3 = texto
+    command -v notify-send >/dev/null || return 0
+    timeout 3 notify-send -u "$1" -a GameKill -i dialog-warning "$2" "$3" \
+        >/dev/null 2>&1 &
+}
+
+# ---------- Leitura de metricas (sem forks) ----------
+
+# Define MEM_AVAIL, SWAP_TOTAL, SWAP_USED (KB)
+read_meminfo() {
+    local key val _ swap_free=0
+    MEM_AVAIL=0 SWAP_TOTAL=0
+    while read -r key val _; do
+        case "$key" in
+            MemAvailable:) MEM_AVAIL=$val ;;
+            SwapTotal:)    SWAP_TOTAL=$val ;;
+            SwapFree:)     swap_free=$val; break ;;
+        esac
+    done < /proc/meminfo
+    SWAP_USED=$(( SWAP_TOTAL - swap_free ))
+}
+
+# "45.12" -> 4512
+to_centi() {
+    local v="$1" int frac
+    int="${v%%.*}"
+    if [[ "$v" == *.* ]]; then frac="${v#*.}00"; else frac="00"; fi
+    frac="${frac:0:2}"
+    printf -v REPLY '%d' "$(( 10#${int:-0} * 100 + 10#$frac ))"
+}
+
+# Define PSI_SOME, PSI_FULL (avg10 em centesimos)
+read_psi() {
+    local kind avg _
+    PSI_SOME=0 PSI_FULL=0
+    while read -r kind avg _; do
+        to_centi "${avg#avg10=}"
+        case "$kind" in
+            some) PSI_SOME=$REPLY ;;
+            full) PSI_FULL=$REPLY ;;
+        esac
+    done < /proc/pressure/memory
+}
+
+read_all() { read_meminfo; read_psi; }
+
+fmt_pct() {  # centesimos -> "45.12"
+    printf '%d.%02d' "$(( $1 / 100 ))" "$(( $1 % 100 ))"
+}
+
+# ---------- Politica ----------
+
+swap_critical() {  # avail swap_total swap_used some
+    (( $2 > 0 && $1 < SWAP_AVAILABLE_KB &&
+       $3 * 100 >= $2 * SWAP_USED_PERCENT && $4 >= SWAP_SOME_PSI ))
+}
+
+initial_critical() {  # avail full some swap_total swap_used
+    (( $1 < MIN_AVAILABLE_KB && $2 >= FULL_PSI_LIMIT )) && return 0
+    (( $1 < LOW_AVAILABLE_KB && $3 >= LOW_SOME_PSI )) && return 0
+    swap_critical "$1" "$4" "$5" "$3"
+}
+
+final_emergency() {  # avail full some swap_total swap_used
+    (( $1 < FINAL_AVAILABLE_KB && $2 >= FINAL_FULL_PSI )) && return 0
+    (( $1 < FINAL_EXTREME_KB && $3 >= FINAL_EXTREME_SOME )) && return 0
+    swap_critical "$1" "$4" "$5" "$3"
+}
+
+# ---------- Jogos ----------
+
+game_scopes() {  # imprime caminhos dos cgroups de jogos Steam
+    local d
+    for d in "$USER_CG"/app.slice/app-steam-app*-*.scope; do
+        [[ -d "$d" ]] && printf '%s\n' "$d"
+    done
+}
+
+# Todos os PIDs de um cgroup e sub-cgroups (ate 3 niveis)
+cgroup_pids() {
+    local f pid
+    for f in "$1"/cgroup.procs "$1"/*/cgroup.procs "$1"/*/*/cgroup.procs \
+             "$1"/*/*/*/cgroup.procs; do
+        while read -r pid; do printf '%s\n' "$pid"; done < "$f" 2>/dev/null
+    done
+}
+
+is_protected_appid() {
+    local line
+    [[ -r "$PROTECTED_FILE" ]] || return 1
+    while read -r line; do
+        line="${line%%#*}"; line="${line//[[:space:]]/}"
+        [[ -n "$line" && "$line" == "$1" ]] && return 0
+    done < "$PROTECTED_FILE"
+    return 1
+}
+
+declare -A CONFIRMED=()   # cache de scopes ja confirmados como jogo
+
+# $1 = caminho do cgroup; $2 = "manual" ignora lista de protegidos
+# Retorna 0 se for jogo Steam valido. Motivo em REJECT_REASON.
+is_steam_game() {
+    local cgdir="$1" unit appid pid
+    local -a args
+    unit="${cgdir##*/}"
+    REJECT_REASON=""
+
+    if [[ ! "$unit" =~ ^app-steam-app([0-9]+)-[0-9]+\.scope$ ]]; then
+        REJECT_REASON="nome fora do padrao de jogo Steam"; return 1
+    fi
+    appid="${BASH_REMATCH[1]}"
+
+    if [[ "${2:-}" != manual ]] && is_protected_appid "$appid"; then
+        REJECT_REASON="AppID $appid protegido"; return 1
+    fi
+    if [[ ! -r "$cgdir/cgroup.procs" ]]; then
+        REJECT_REASON="cgroup inacessivel"; return 1
+    fi
+    [[ -n "${CONFIRMED[$unit]+x}" ]] && return 0
+
+    while read -r pid; do
+        mapfile -d '' -t args < "/proc/$pid/cmdline" 2>/dev/null || continue
+        if [[ " ${args[*]} " == *" SteamLaunch AppId=$appid "* ]]; then
+            CONFIRMED[$unit]=1
+            return 0
+        fi
+    done < <(cgroup_pids "$cgdir")
+
+    REJECT_REASON="sem processo reaper SteamLaunch AppId=$appid"
+    return 1
+}
+
+cg_mem() { local m=0; read -r m < "$1/memory.current" 2>/dev/null; echo "${m:-0}"; }
+
+# Define BEST_CG (vazio se nenhum)
+find_largest_game() {
+    local cg mem best=0
+    BEST_CG=""
+    while IFS= read -r cg; do
+        is_steam_game "$cg" "${1:-}" || continue
+        read -r mem < "$cg/memory.current" 2>/dev/null || continue
+        (( mem > best )) && { best=$mem; BEST_CG=$cg; }
+    done < <(game_scopes)
+}
+
+# Faz o kernel OOM preferir o jogo ao KWin/Plasma. Aumentar o proprio
+# oom_score_adj nao exige privilegios.
+boost_game_oom_score() {
+    local cg pid cur
+    while IFS= read -r cg; do
+        is_steam_game "$cg" manual || continue
+        while read -r pid; do
+            read -r cur < "/proc/$pid/oom_score_adj" 2>/dev/null || continue
+            (( cur < GAME_OOM_SCORE_ADJ )) &&
+                { printf '%d' "$GAME_OOM_SCORE_ADJ" > "/proc/$pid/oom_score_adj"; } 2>/dev/null
+        done < <(cgroup_pids "$cg")
+    done < <(game_scopes)
+}
+
+any_game_running() {
+    local cg
+    for cg in "$USER_CG"/app.slice/app-steam-app*-*.scope; do
+        is_steam_game "$cg" manual && return 0
+    done
+    return 1
+}
+
+kill_game() {  # $1 = caminho do cgroup, $2 = motivo
+    local cg="$1" unit="${1##*/}" i
+    log "ENCERRANDO $unit ($2)"
+    (( DRY_RUN )) && { log "DRY-RUN: nenhum sinal enviado."; return 0; }
+
+    if ! systemctl --user kill --kill-whom=all --signal=TERM "$unit" 2>/dev/null; then
+        log "systemctl falhou; usando cgroup.kill"
+        echo 1 > "$cg/cgroup.kill" 2>/dev/null
+    fi
+
+    for ((i=0; i<10; i++)); do
+        [[ -d "$cg" ]] || { log "Jogo encerrou normalmente: $unit"; break; }
+        sleep 0.5
+    done
+
+    if [[ -d "$cg" ]]; then
+        log "SIGKILL necessario para $unit"
+        systemctl --user kill --kill-whom=all --signal=KILL "$unit" 2>/dev/null ||
+            echo 1 > "$cg/cgroup.kill" 2>/dev/null
+        sleep 2
+        [[ -d "$cg" ]] && log "ATENCAO: $unit ainda ativo apos SIGKILL." ||
+            log "Jogo encerrado com SIGKILL: $unit"
+    fi
+    notify critical "Jogo encerrado pelo GameKill" "$unit foi encerrado: $2."
+}
+
+# ---------- Failsafes do KDE ----------
+
+cg_has_procs() {
+    local pid
+    [[ -r "$1/cgroup.procs" ]] || return 1
+    read -r pid < "$1/cgroup.procs" 2>/dev/null && [[ -n "$pid" ]]
+}
+
+session_active() { cg_has_procs "$SESSION_CG/plasma-kwin_wayland.service"; }
+
+kwin_responds() {
+    timeout $((KWIN_PING_TIMEOUT + 1)) busctl --user --timeout="$KWIN_PING_TIMEOUT" \
+        get-property org.kde.KWin /KWin org.kde.KWin showingDesktop >/dev/null 2>&1
+}
+
+KWIN_FAILS=0
+PLASMA_DOWN=0
+declare -a PLASMA_RESTARTS=()
+
+check_plasmashell() {
+    local now=$EPOCHSECONDS t state
+    local -a recent=()
+
+    if cg_has_procs "$SESSION_CG/plasma-plasmashell.service"; then
+        PLASMA_DOWN=0; return
+    fi
+    (( ++PLASMA_DOWN < PLASMA_DOWN_LIMIT )) && return
+
+    state=$(systemctl --user show plasma-plasmashell.service -p ActiveState --value 2>/dev/null)
+    [[ "$state" == active || "$state" == activating || "$state" == reloading ]] &&
+        { PLASMA_DOWN=0; return; }
+
+    for t in "${PLASMA_RESTARTS[@]}"; do (( now - t < 3600 )) && recent+=("$t"); done
+    PLASMA_RESTARTS=("${recent[@]}")
+    if (( ${#PLASMA_RESTARTS[@]} >= PLASMA_MAX_RESTARTS )); then
+        (( PLASMA_DOWN == PLASMA_DOWN_LIMIT )) &&
+            log "plasmashell caiu ${PLASMA_MAX_RESTARTS}x na ultima hora; desistindo por ora."
+        return
+    fi
+
+    log "FAILSAFE: plasmashell fora do ar ($state). Reiniciando."
+    PLASMA_RESTARTS+=("$now")
+    PLASMA_DOWN=0
+    (( DRY_RUN )) && return
+    systemctl --user reset-failed plasma-plasmashell.service 2>/dev/null
+    systemctl --user start --no-block plasma-plasmashell.service 2>/dev/null ||
+        log "Falha ao reiniciar plasmashell."
+}
+
+check_kwin_hang() {
+    # So vale a pena (e so e seguro agir) com jogo rodando e KWin vivo.
+    if ! any_game_running || ! session_active; then
+        KWIN_FAILS=0; return
+    fi
+    if kwin_responds; then
+        (( KWIN_FAILS > 0 )) && log "KWin voltou a responder apos $KWIN_FAILS falha(s)."
+        KWIN_FAILS=0; return
+    fi
+    (( ++KWIN_FAILS ))
+    log "KWin sem resposta ($KWIN_FAILS/$KWIN_HANG_LIMIT) com jogo ativo."
+    (( KWIN_FAILS < KWIN_HANG_LIMIT )) && return
+
+    KWIN_FAILS=0
+    find_largest_game manual
+    if [[ -n "$BEST_CG" ]]; then
+        kill_game "$BEST_CG" "interface (KWin) travada por mais de 1 minuto"
+        KILL_BLOCKED_UNTIL=$(( EPOCHSECONDS + COOLDOWN ))
+    fi
+}
+
+# ---------- Modos ----------
+
+status() {
+    local cg unit mem adj pid f
+    read_all
+    echo "========== GAMEKILL STATUS =========="
+    printf 'RAM disponivel: %d MiB\n' "$(( MEM_AVAIL / 1024 ))"
+    if (( SWAP_TOTAL > 0 )); then
+        printf 'Swap utilizada: %d%%\n' "$(( SWAP_USED * 100 / SWAP_TOTAL ))"
+    else
+        echo "Swap: indisponivel"
+    fi
+    echo "PSI full avg10: $(fmt_pct "$PSI_FULL")%"
+    echo "PSI some avg10: $(fmt_pct "$PSI_SOME")%"
+    echo
+    echo "Jogos Steam ativos:"
+    while IFS= read -r cg; do
+        unit="${cg##*/}"
+        mem=$(cg_mem "$cg")
+        printf '  %s: %d MiB\n' "$unit" "$(( mem / 1048576 ))"
+        if is_steam_game "$cg"; then
+            echo "    candidato valido: sim"
+        else
+            echo "    candidato valido: NAO ($REJECT_REASON)"
+        fi
+        pid=$(cgroup_pids "$cg" | head -1)
+        [[ -n "$pid" ]] && echo "    oom_score_adj: $(< /proc/$pid/oom_score_adj)"
+    done < <(game_scopes)
+
+    echo
+    echo "Protecao do KDE contra o systemd-oomd:"
+    for f in plasma-kwin_wayland plasma-plasmashell plasma-ksmserver; do
+        if getfattr -n user.oomd_omit --only-values "$SESSION_CG/$f.service" 2>/dev/null | grep -q 1; then
+            echo "  $f: omit (protegido)"
+        else
+            echo "  $f: SEM protecao"
+        fi
+    done
+    local u s
+    u=$(systemctl show "user@$UID.service" -p ManagedOOMMemoryPressure --value 2>/dev/null)
+    s=$(systemctl show "user-$UID.slice" -p ManagedOOMMemoryPressure -p ManagedOOMSwap --value 2>/dev/null | tr '\n' ' ')
+    echo "  oomd em user@$UID.service: pressure=$u (deve ser kill)"
+    echo "  oomd em user-$UID.slice: pressure/swap=$s(deve ser auto auto)"
+    if [[ "$u" != kill ]]; then
+        echo "  >> Protecao de sistema NAO instalada: rode"
+        echo "     sudo ~/.config/gamekill/system/install-system.sh"
+    fi
+    printf '  KDE memory.low: %d MiB\n' "$(( $(< "$SESSION_CG/memory.low") / 1048576 ))"
+    echo "  SysRq (Alt+PrtSc+F mata o jogo): kernel.sysrq=$(< /proc/sys/kernel/sysrq) (precisa incluir 64)"
+    echo
+    printf 'KWin responde: '; kwin_responds && echo sim || echo NAO
+}
+
+run_test_case() {
+    local name="$1" avail="$2" full="$3" some="$4" st="$5" su="$6"
+    local exp_i="$7" exp_f="$8" got_i=0 got_f=0 ok=0
+    to_centi "$full"; full=$REPLY
+    to_centi "$some"; some=$REPLY
+    initial_critical "$avail" "$full" "$some" "$st" "$su" && got_i=1
+    final_emergency  "$avail" "$full" "$some" "$st" "$su" && got_f=1
+    (( got_i == exp_i && got_f == exp_f )) && ok=1
+    printf '  %-48s inicial=%s final=%s %s\n' "$name" "$got_i" "$got_f" \
+        "$( (( ok )) && echo '[OK]' || echo "[FALHOU: esperado $exp_i/$exp_f]")"
+    (( ok ))
+}
+
+simulate_test() {
+    local failures=0
+    echo "========== GAMEKILL TESTE DE CENARIOS =========="
+    echo "Valores simulados: nenhum processo sera encerrado."
+    run_test_case "Normal"                                  3145728 0.5 0.6 1000000 200000 0 0 || ((failures++))
+    run_test_case "Pressao elevada, sem emergencia final"   300000  45  50  1000000 200000 1 0 || ((failures++))
+    run_test_case "Emergencia persistente"                  150000  65  75  1000000 900000 1 1 || ((failures++))
+    run_test_case "Memoria recuperada"                      2097152 1   2   1000000 200000 0 0 || ((failures++))
+    run_test_case "Swap praticamente esgotada"              300000  10  65  1000000 995000 1 1 || ((failures++))
+    run_test_case "Swap 88% (antes do OOMD), pressao severa" 300000 10  65  1000000 880000 1 1 || ((failures++))
+    run_test_case "RAM baixa isolada, sem pressao"          150000  5   10  1000000 500000 0 0 || ((failures++))
+    run_test_case "Swap 95% isolada, sem pressao"           300000  2   8   1000000 950000 0 0 || ((failures++))
+    run_test_case "PSI full 39.99% (limite, nao conta)"     300000  39.99 50 1000000 200000 0 0 || ((failures++))
+    run_test_case "PSI full 40.00% (limite, conta)"         300000  40.00 50 1000000 200000 1 0 || ((failures++))
+
+    echo
+    find_largest_game
+    if [[ -n "$BEST_CG" ]]; then
+        echo "Candidato atual: ${BEST_CG##*/} ($(( $(cg_mem "$BEST_CG") / 1048576 )) MiB)"
+    else
+        echo "Nenhum jogo Steam ativo no momento."
+    fi
+    echo
+    if (( failures == 0 )); then
+        echo "TODOS OS TESTES PASSARAM. Nenhum sinal foi enviado."
+    else
+        echo "$failures CENARIO(S) FALHARAM. Nao use o modo automatico."
+        return 1
+    fi
+}
+
+kill_now() {
+    find_largest_game manual
+    if [[ -z "$BEST_CG" ]]; then
+        log "--kill-now: nenhum jogo Steam ativo."
+        notify normal "GameKill" "Nenhum jogo Steam ativo."
+        return 1
+    fi
+    kill_game "$BEST_CG" "solicitado manualmente"
+}
+
+case "$MODE" in
+    --status)   status; exit 0 ;;
+    --test)     simulate_test; exit $? ;;
+    --kill-now) kill_now; exit $? ;;
+    --auto)     ;;
+    --dry-run)  DRY_RUN=1 ;;
+    *)
+        cat <<EOF
+Uso:
+  gamekill-watchdog --status     estado atual e protecoes
+  gamekill-watchdog --test       testa a politica com valores simulados
+  gamekill-watchdog --dry-run    monitora sem encerrar nada
+  gamekill-watchdog --auto       modo servico
+  gamekill-watchdog --kill-now   encerra o maior jogo Steam agora (atalho/TTY)
+EOF
+        exit 0 ;;
+esac
+
+# ---------- Loop principal ----------
+
+log "Watchdog v3 iniciado. Dry-run=$DRY_RUN"
+BAD_COUNT=0
+TICK=0
+KILL_BLOCKED_UNTIL=0
+
+while true; do
+    (( TICK++ ))
+
+    if (( TICK % GAME_SCAN_EVERY == 0 )); then
+        boost_game_oom_score
+    fi
+    if (( TICK % KDE_CHECK_EVERY == 0 )) && session_active; then
+        check_plasmashell
+        check_kwin_hang
+    fi
+
+    read_all
+    if initial_critical "$MEM_AVAIL" "$PSI_FULL" "$PSI_SOME" "$SWAP_TOTAL" "$SWAP_USED"; then
+        (( BAD_COUNT++ ))
+    else
+        BAD_COUNT=0
+    fi
+
+    if (( BAD_COUNT >= REQUIRED_COUNT && EPOCHSECONDS >= KILL_BLOCKED_UNTIL )); then
+        BAD_COUNT=0
+        find_largest_game
+
+        if [[ -z "$BEST_CG" ]]; then
+            log "Pressao critica, mas nenhum jogo Steam valido esta ativo."
+            notify normal "Memoria critica" "Pressao severa de memoria. Feche apps que nao estiver usando."
+            KILL_BLOCKED_UNTIL=$(( EPOCHSECONDS + RECOVERED_COOLDOWN ))
+            nap "$INTERVAL"; continue
+        fi
+
+        log "Pressao critica persistente (RAM=${MEM_AVAIL}KB full=$(fmt_pct "$PSI_FULL")% some=$(fmt_pct "$PSI_SOME")%). Candidato: ${BEST_CG##*/}"
+
+        if (( DRY_RUN )); then
+            log "DRY-RUN: nenhuma acao sera executada."
+            KILL_BLOCKED_UNTIL=$(( EPOCHSECONDS + RECOVERED_COOLDOWN ))
+            nap "$INTERVAL"; continue
+        fi
+
+        if [[ -x "$HOOK" ]]; then
+            log "Executando rotina de recuperacao."
+            timeout "$RECOVERY_TIMEOUT" "$HOOK" "${BEST_CG##*/}" ||
+                log "Rotina de recuperacao retornou erro ou excedeu ${RECOVERY_TIMEOUT}s."
+        fi
+
+        log "Aguardando ${RECOVERY_WAIT}s para o sistema se recuperar."
+        nap "$RECOVERY_WAIT"
+
+        FINAL_COUNT=0
+        for ((i=0; i<FINAL_REQUIRED_COUNT; i++)); do
+            read_all
+            if final_emergency "$MEM_AVAIL" "$PSI_FULL" "$PSI_SOME" "$SWAP_TOTAL" "$SWAP_USED"; then
+                (( FINAL_COUNT++ ))
+            else
+                FINAL_COUNT=0
+            fi
+            nap "$INTERVAL"
+        done
+
+        if (( FINAL_COUNT >= FINAL_REQUIRED_COUNT )); then
+            find_largest_game
+            if [[ -n "$BEST_CG" ]]; then
+                kill_game "$BEST_CG" "memoria esgotada (RAM=$(( MEM_AVAIL / 1024 ))MiB, PSI full=$(fmt_pct "$PSI_FULL")%)"
+            else
+                log "Emergencia persistente, mas nenhum jogo Steam valido esta ativo."
+            fi
+            KILL_BLOCKED_UNTIL=$(( EPOCHSECONDS + COOLDOWN ))
+        else
+            log "Memoria recuperada. Jogo preservado."
+            KILL_BLOCKED_UNTIL=$(( EPOCHSECONDS + RECOVERED_COOLDOWN ))
+        fi
+        log "Encerramentos automaticos pausados ate $(printf '%(%H:%M:%S)T' "$KILL_BLOCKED_UNTIL")."
+    fi
+
+    nap "$INTERVAL"
+done

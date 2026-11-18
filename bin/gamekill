@@ -1,0 +1,148 @@
+#!/usr/bin/env bash
+set -uo pipefail
+
+# GameKill - Steam game emergency termination utility
+# Compatible with systemd user scopes and Steam/Proton.
+
+if ! systemctl --user show-environment >/dev/null 2>&1; then
+    echo "ERRO: o gerenciador systemd do usuario nao esta acessivel."
+    exit 1
+fi
+
+get_memory() {
+    local bytes
+    bytes=$(systemctl --user show "$1" -p MemoryCurrent --value 2>/dev/null)
+    if [[ "$bytes" =~ ^[0-9]+$ ]]; then
+        awk -v b="$bytes" 'BEGIN {
+            if (b >= 1073741824) printf "%.2f GiB", b/1073741824
+            else if (b >= 1048576) printf "%.0f MiB", b/1048576
+            else printf "%.0f KiB", b/1024
+        }'
+    else
+        echo "indisponivel"
+    fi
+}
+
+get_processes() {
+    local unit="$1"
+    local cg file path pid comm
+    local -A seen=()
+
+    cg=$(systemctl --user show "$unit" -p ControlGroup --value 2>/dev/null) || return
+
+    for file in /proc/[0-9]*/cgroup; do
+        [[ -r "$file" ]] || continue
+
+        while IFS= read -r path; do
+            [[ "$path" == "$cg" || "$path" == "$cg/"* ]] || continue
+
+            pid="${file#/proc/}"
+            pid="${pid%/cgroup}"
+
+            [[ -r "/proc/$pid/comm" ]] || continue
+            comm=$(<"/proc/$pid/comm")
+
+            if [[ -z "${seen[$comm]+x}" ]]; then
+                seen["$comm"]=1
+                printf '  - %s (PID %s)\n' "$comm" "$pid"
+            fi
+        done < <(awk -F: '$1 == "0" {print $3}' "$file" 2>/dev/null)
+    done
+}
+
+mapfile -t games < <(
+    systemctl --user list-units \
+        --type=scope --state=running --no-legend --plain |
+    awk '$1 ~ /^app-steam-app[0-9]+-[0-9]+\.scope$/ {print $1}'
+)
+
+if ((${#games[@]} == 0)); then
+    echo "Nenhum jogo Steam ativo foi encontrado."
+    exit 0
+fi
+
+echo
+echo "======================================"
+echo "          GAMEKILL - CachyOS"
+echo "======================================"
+echo
+echo "Jogos Steam identificados:"
+echo
+
+for i in "${!games[@]}"; do
+    printf '[%d] %s\n' "$((i+1))" "${games[$i]}"
+    printf '    RAM: %s\n' "$(get_memory "${games[$i]}")"
+    get_processes "${games[$i]}"
+    echo
+done
+
+echo "[0] Sair"
+echo
+read -r -p "Selecione o jogo para encerrar: " choice
+
+[[ "$choice" == "0" ]] && exit 0
+
+if [[ ! "$choice" =~ ^[0-9]+$ ]] ||
+   ((choice < 1 || choice > ${#games[@]})); then
+    echo "Selecao invalida."
+    exit 1
+fi
+
+unit="${games[$((choice-1))]}"
+
+echo
+echo "Jogo selecionado: $unit"
+echo "RAM: $(get_memory "$unit")"
+echo
+read -r -p "Enviar SIGTERM para todos os processos deste jogo? [s/N] " confirm
+
+[[ "$confirm" =~ ^[sS]$ ]] || {
+    echo "Operacao cancelada."
+    exit 0
+}
+
+echo
+echo "Enviando SIGTERM..."
+
+if ! systemctl --user kill --kill-whom=all --signal=TERM "$unit"; then
+    echo "Nao foi possivel enviar SIGTERM."
+    exit 1
+fi
+
+# Wait up to five seconds for graceful termination.
+for ((i=0; i<10; i++)); do
+    if ! systemctl --user is-active --quiet "$unit"; then
+        echo "Jogo encerrado normalmente."
+        exit 0
+    fi
+    sleep 0.5
+done
+
+if ! systemctl --user is-active --quiet "$unit"; then
+    echo "Jogo encerrado normalmente."
+    exit 0
+fi
+
+echo
+echo "O jogo ainda esta ativo."
+read -r -p "Forcar encerramento com SIGKILL? [s/N] " force
+
+[[ "$force" =~ ^[sS]$ ]] || {
+    echo "Encerramento forcado cancelado."
+    exit 0
+}
+
+echo "Enviando SIGKILL..."
+
+if systemctl --user kill --kill-whom=all --signal=KILL "$unit"; then
+    echo "SIGKILL enviado."
+    sleep 1
+    if ! systemctl --user is-active --quiet "$unit"; then
+        echo "Jogo encerrado com sucesso."
+    else
+        echo "O scope continua ativo. Verifique o estado do sistema."
+    fi
+else
+    echo "Falha ao enviar SIGKILL."
+    exit 1
+fi

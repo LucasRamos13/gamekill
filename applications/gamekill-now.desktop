@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=GameKill: encerrar jogo agora
+Comment=Encerra imediatamente o jogo Steam que mais usa memoria
+Exec=@BINDIR@/gamekill-watchdog --kill-now
+Icon=process-stop
+Terminal=false
+Categories=System;
+NoDisplay=false
